@@ -1,6 +1,7 @@
 <script>
   import { shoppingCategory } from "./stores.js";
   import { shoppingCart } from "./stores.js";
+  import { fade, fly } from "svelte/transition";
   let name = "world!!";
 
   function handleCategorySelect(event) {
@@ -16,7 +17,7 @@
 <style>
   #main-container {
     display: flex;
-    background: red;
+    background: #eeeeee;
   }
 
   #categories-section {
@@ -24,22 +25,66 @@
     height: 100vh;
   }
 
+  #categories-section ul {
+    list-style-type: none;
+	text-align: left;
+  }
+
+  #categories-section li {
+    padding-bottom: 20px;
+  }
+
+  li:hover {
+    font-weight: bold;
+  }
+
   #shopping-section {
+    padding: 0;
     width: 50vw;
     height: 100vh;
-    background: pink;
+    background: #fff;
   }
 
   #shopping-cart-section {
     width: 25vw;
     height: 100vh;
-    background: #dddddd;
+    background: #eeeeee;
   }
+
+  #main-container > div {
+    padding: 20px 20px 0 20px;
+  }
+
+  h2 {
+    margin: 0;
+    margin-bottom: 50px;
+  }
+
+  h3 {
+    font-size: 20px;
+  }
+
+  #shopping-cart-section h3 {
+    font-size: 14px;
+  }
+
+  #shopping-cart-section button {
+    font-size: 12px;
+    min-width: 25px;
+  }
+
+  #shopping-cart-container{
+	  height: 100vh;
+	  background: #fff;
+	  box-shadow: 4px 4px 8px #888888;
+	  padding: 20px;
+  }
+
 </style>
 
 <div id="main-container">
   <div id="categories-section">
-    Categories area
+    <h2>Categories</h2>
     <ul>
       <li id="mcmuffins" on:click={handleCategorySelect}>McMuffins</li>
       <li id="wraps" on:click={handleCategorySelect}>Wraps & Rolls</li>
@@ -59,7 +104,7 @@
           </p>
           <p>
             <!-- to 2 decimal places -->
-            {Math.trunc($shoppingCart.doubleSausageMcmuffin.price * 100) / 100}
+            £{Math.trunc($shoppingCart.doubleSausageMcmuffin.price * 100) / 100}
           </p>
           <button
             id="doubleSausageMcmuffin"
@@ -75,7 +120,7 @@
           </p>
           <p>
             <!-- to 2 decimal places -->
-            {Math.trunc($shoppingCart.doubleSausageMcmuffinMeal.price * 100) / 100}
+            £{Math.trunc($shoppingCart.doubleSausageMcmuffinMeal.price * 100) / 100}
           </p>
           <button
             id="doubleSausageMcmuffinMeal"
@@ -94,7 +139,7 @@
           </p>
           <p>
             <!-- to 2 decimal places -->
-            {Math.trunc($shoppingCart.baconBrownSauce.price * 100) / 100}
+            £{Math.trunc($shoppingCart.baconBrownSauce.price * 100) / 100}
           </p>
           <button
             id="baconBrownSauce"
@@ -110,7 +155,7 @@
           </p>
           <p>
             <!-- to 2 decimal places -->
-            {Math.trunc($shoppingCart.baconBrownSauceMeal.price * 100) / 100}
+            £{Math.trunc($shoppingCart.baconBrownSauceMeal.price * 100) / 100}
           </p>
           <button
             id="baconBrownSauceMeal"
@@ -129,7 +174,7 @@
           </p>
           <p>
             <!-- to 2 decimal places -->
-            {Math.trunc($shoppingCart.pancakeSausageSyrup.price * 100) / 100}
+            £{Math.trunc($shoppingCart.pancakeSausageSyrup.price * 100) / 100}
           </p>
           <button
             id="pancakeSausageSyrup"
@@ -145,7 +190,7 @@
           </p>
           <p>
             <!-- to 2 decimal places -->
-            {Math.trunc($shoppingCart.pancakeSausageMeal.price * 100) / 100}
+            £{Math.trunc($shoppingCart.pancakeSausageMeal.price * 100) / 100}
           </p>
           <button
             id="pancakeSausageMeal"
@@ -157,99 +202,114 @@
   </div>
 
   <div id="shopping-cart-section">
-    Shopping cart {#if $shoppingCart.doubleSausageMcmuffin.count}
-      <p>Double Sausage and Egg McMuffin®</p>
-      {$shoppingCart.doubleSausageMcmuffin.count}
-      <!-- to 2 decimal places -->
-      {Math.trunc($shoppingCart.doubleSausageMcmuffin.price * $shoppingCart.doubleSausageMcmuffin.count * 100) / 100 + $shoppingCart.doubleSausageMcmuffin.isLarge * $shoppingCart.doubleSausageMcmuffin.count}
-      <button
-        id="decrement"
-        on:click={() => $shoppingCart['doubleSausageMcmuffin']['count']--}>-</button>
-      <button
-        id="increment"
-        on:click={() => $shoppingCart['doubleSausageMcmuffin']['count']++}>+</button>
-      <button
-        id="isLarge"
-        on:click={() => ($shoppingCart['doubleSausageMcmuffin']['isLarge'] = Math.abs($shoppingCart['doubleSausageMcmuffin']['isLarge'] - 1))}>SuperSize!</button>
-    {/if}
-    {#if $shoppingCart.doubleSausageMcmuffinMeal.count}
-      <p>Double Sausage and Egg McMuffin®</p>
-      {$shoppingCart.doubleSausageMcmuffinMeal.count}
-      <!-- Price -->
-      <!-- to 2 decimal places -->
-      {Math.trunc($shoppingCart.doubleSausageMcmuffinMeal.price * $shoppingCart.doubleSausageMcmuffinMeal.count * 100) / 100 + $shoppingCart.doubleSausageMcmuffinMeal.isLarge * $shoppingCart.doubleSausageMcmuffinMeal.count}
-      <button
-        class="decrement-button"
-        id="decrement"
-        on:click={() => $shoppingCart['doubleSausageMcmuffinMeal']['count']--}>-</button>
-      <button
-        id="increment"
-        on:click={() => $shoppingCart['doubleSausageMcmuffinMeal']['count']++}>+</button>
-      <button
-        id="isLarge"
-        on:click={() => ($shoppingCart['doubleSausageMcmuffinMeal']['isLarge'] = Math.abs($shoppingCart['doubleSausageMcmuffinMeal']['isLarge'] - 1))}>SuperSize!</button>
-    {/if}
-    {#if $shoppingCart.baconBrownSauce.count}
-      <p>Bacon Roll with Brown Sauce</p>
-      {$shoppingCart.baconBrownSauce.count}
-      <!-- to 2 decimal places -->
-      {Math.trunc($shoppingCart.baconBrownSauce.price * $shoppingCart.baconBrownSauce.count * 100) / 100 + $shoppingCart.baconBrownSauce.isLarge * $shoppingCart.baconBrownSauce.count}
-      <button
-        id="decrement"
-        on:click={() => $shoppingCart['baconBrownSauce']['count']--}>-</button>
-      <button
-        id="increment"
-        on:click={() => $shoppingCart['baconBrownSauce']['count']++}>+</button>
-      <button
-        id="isLarge"
-        on:click={() => ($shoppingCart['baconBrownSauce']['isLarge'] = Math.abs($shoppingCart['baconBrownSauce']['isLarge'] - 1))}>SuperSize!</button>
-    {/if}
-    {#if $shoppingCart.baconBrownSauceMeal.count}
-      <p>Bacon Roll with Brown Sauce Meal</p>
-      {$shoppingCart.baconBrownSauceMeal.count}
-      <!-- Price -->
-      <!-- to 2 decimal places -->
-      {Math.trunc($shoppingCart.baconBrownSauceMeal.price * $shoppingCart.baconBrownSauceMeal.count * 100) / 100 + $shoppingCart.baconBrownSauceMeal.isLarge * $shoppingCart.baconBrownSauceMeal.count}
-      <button
-        id="decrement"
-        on:click={() => $shoppingCart['baconBrownSauceMeal']['count']--}>-</button>
-      <button
-        id="increment"
-        on:click={() => $shoppingCart['baconBrownSauceMeal']['count']++}>+</button>
-      <button
-        id="isLarge"
-        on:click={() => ($shoppingCart['baconBrownSauceMeal']['isLarge'] = Math.abs($shoppingCart['baconBrownSauceMeal']['isLarge'] - 1))}>SuperSize!</button>
-    {/if}
-    {#if $shoppingCart.pancakeSausageSyrup.count}
-      <p>Pancakes & Sausage with Syrup</p>
-      {$shoppingCart.pancakeSausageSyrup.count}
-      <!-- to 2 decimal places -->
-      {Math.trunc($shoppingCart.pancakeSausageSyrup.price * $shoppingCart.pancakeSausageSyrup.count * 100) / 100 + $shoppingCart.pancakeSausageSyrup.isLarge * $shoppingCart.pancakeSausageSyrup.count}
-      <button
-        id="decrement"
-        on:click={() => $shoppingCart['pancakeSausageSyrup']['count']--}>-</button>
-      <button
-        id="increment"
-        on:click={() => $shoppingCart['pancakeSausageSyrup']['count']++}>+</button>
-      <button
-        id="isLarge"
-        on:click={() => ($shoppingCart['pancakeSausageSyrup']['isLarge'] = Math.abs($shoppingCart['pancakeSausageSyrup']['isLarge'] - 1))}>SuperSize!</button>
-    {/if}
-    {#if $shoppingCart.pancakeSausageMeal.count}
-      <p>Pancakes & Sausage Meal</p>
-      {$shoppingCart.pancakeSausageMeal.count}
-      <!-- Price -->
-      <!-- to 2 decimal places -->
-      {Math.trunc($shoppingCart.pancakeSausageMeal.price * $shoppingCart.pancakeSausageMeal.count * 100) / 100 + $shoppingCart.pancakeSausageMeal.isLarge * $shoppingCart.pancakeSausageMeal.count}
-      <button
-        id="decrement"
-        on:click={() => $shoppingCart['pancakeSausageMeal']['count']--}>-</button>
-      <button
-        id="increment"
-        on:click={() => $shoppingCart['pancakeSausageMeal']['count']++}>+</button>
-      <button
-        id="isLarge"
-        on:click={() => ($shoppingCart['pancakeSausageMeal']['isLarge'] = Math.abs($shoppingCart['pancakeSausageMeal']['isLarge'] - 1))}>SuperSize!</button>
-    {/if}
+    <div id="shopping-cart-container">
+      <h2>Your order</h2>
+      {#if $shoppingCart.doubleSausageMcmuffin.count}
+        <div class="checkout-item" in:fly={{ y: 200, duration: 500 }}>
+          <h3>Double Sausage and Egg McMuffin®</h3>
+          x{$shoppingCart.doubleSausageMcmuffin.count}
+          <!-- to 2 decimal places -->
+          £{Math.trunc($shoppingCart.doubleSausageMcmuffin.price * $shoppingCart.doubleSausageMcmuffin.count * 100) / 100 + $shoppingCart.doubleSausageMcmuffin.isLarge * $shoppingCart.doubleSausageMcmuffin.count}
+          <button
+            id="decrement"
+            on:click={() => $shoppingCart['doubleSausageMcmuffin']['count']--}>-</button>
+          <button
+            id="increment"
+            on:click={() => $shoppingCart['doubleSausageMcmuffin']['count']++}>+</button>
+          <button
+            id="isLarge"
+            on:click={() => ($shoppingCart['doubleSausageMcmuffin']['isLarge'] = Math.abs($shoppingCart['doubleSausageMcmuffin']['isLarge'] - 1))}>SuperSize!</button>
+        </div>
+      {/if}
+      {#if $shoppingCart.doubleSausageMcmuffinMeal.count}
+        <div class="checkout-item" in:fly={{ y: 200, duration: 500 }}>
+          <h3>Double Sausage and Egg McMuffin®</h3>
+          x{$shoppingCart.doubleSausageMcmuffinMeal.count}
+          <!-- Price -->
+          <!-- to 2 decimal places -->
+          £{Math.trunc($shoppingCart.doubleSausageMcmuffinMeal.price * $shoppingCart.doubleSausageMcmuffinMeal.count * 100) / 100 + $shoppingCart.doubleSausageMcmuffinMeal.isLarge * $shoppingCart.doubleSausageMcmuffinMeal.count}
+          <button
+            class="decrement-button"
+            id="decrement"
+            on:click={() => $shoppingCart['doubleSausageMcmuffinMeal']['count']--}>-</button>
+          <button
+            id="increment"
+            on:click={() => $shoppingCart['doubleSausageMcmuffinMeal']['count']++}>+</button>
+          <button
+            id="isLarge"
+            on:click={() => ($shoppingCart['doubleSausageMcmuffinMeal']['isLarge'] = Math.abs($shoppingCart['doubleSausageMcmuffinMeal']['isLarge'] - 1))}>SuperSize!</button>
+        </div>
+      {/if}
+      {#if $shoppingCart.baconBrownSauce.count}
+        <div class="checkout-item" in:fly={{ y: 200, duration: 500 }}>
+          <h3>Bacon Roll with Brown Sauce</h3>
+          x{$shoppingCart.baconBrownSauce.count}
+          <!-- to 2 decimal places -->
+          £{Math.trunc($shoppingCart.baconBrownSauce.price * $shoppingCart.baconBrownSauce.count * 100) / 100 + $shoppingCart.baconBrownSauce.isLarge * $shoppingCart.baconBrownSauce.count}
+          <button
+            id="decrement"
+            on:click={() => $shoppingCart['baconBrownSauce']['count']--}>-</button>
+          <button
+            id="increment"
+            on:click={() => $shoppingCart['baconBrownSauce']['count']++}>+</button>
+          <button
+            id="isLarge"
+            on:click={() => ($shoppingCart['baconBrownSauce']['isLarge'] = Math.abs($shoppingCart['baconBrownSauce']['isLarge'] - 1))}>SuperSize!</button>
+        </div>
+      {/if}
+      {#if $shoppingCart.baconBrownSauceMeal.count}
+        <div class="checkout-item" in:fly={{ y: 200, duration: 500 }}>
+          <h3>Bacon Roll with Brown Sauce Meal</h3>
+          x{$shoppingCart.baconBrownSauceMeal.count}
+          <!-- Price -->
+          <!-- to 2 decimal places -->
+          £{Math.trunc($shoppingCart.baconBrownSauceMeal.price * $shoppingCart.baconBrownSauceMeal.count * 100) / 100 + $shoppingCart.baconBrownSauceMeal.isLarge * $shoppingCart.baconBrownSauceMeal.count}
+          <button
+            id="decrement"
+            on:click={() => $shoppingCart['baconBrownSauceMeal']['count']--}>-</button>
+          <button
+            id="increment"
+            on:click={() => $shoppingCart['baconBrownSauceMeal']['count']++}>+</button>
+          <button
+            id="isLarge"
+            on:click={() => ($shoppingCart['baconBrownSauceMeal']['isLarge'] = Math.abs($shoppingCart['baconBrownSauceMeal']['isLarge'] - 1))}>SuperSize!</button>
+        </div>
+      {/if}
+      {#if $shoppingCart.pancakeSausageSyrup.count}
+        <div class="checkout-item" in:fly={{ y: 200, duration: 500 }}>
+          <h3>Pancakes & Sausage with Syrup</h3>
+          x{$shoppingCart.pancakeSausageSyrup.count}
+          <!-- to 2 decimal places -->
+          £{Math.trunc($shoppingCart.pancakeSausageSyrup.price * $shoppingCart.pancakeSausageSyrup.count * 100) / 100 + $shoppingCart.pancakeSausageSyrup.isLarge * $shoppingCart.pancakeSausageSyrup.count}
+          <button
+            id="decrement"
+            on:click={() => $shoppingCart['pancakeSausageSyrup']['count']--}>-</button>
+          <button
+            id="increment"
+            on:click={() => $shoppingCart['pancakeSausageSyrup']['count']++}>+</button>
+          <button
+            id="isLarge"
+            on:click={() => ($shoppingCart['pancakeSausageSyrup']['isLarge'] = Math.abs($shoppingCart['pancakeSausageSyrup']['isLarge'] - 1))}>SuperSize!</button>
+        </div>
+      {/if}
+      {#if $shoppingCart.pancakeSausageMeal.count}
+        <div class="checkout-item" in:fly={{ y: 200, duration: 500 }}>
+          <h3>Pancakes & Sausage Meal</h3>
+          x{$shoppingCart.pancakeSausageMeal.count}
+          <!-- Price -->
+          <!-- to 2 decimal places -->
+          £{Math.trunc($shoppingCart.pancakeSausageMeal.price * $shoppingCart.pancakeSausageMeal.count * 100) / 100 + $shoppingCart.pancakeSausageMeal.isLarge * $shoppingCart.pancakeSausageMeal.count}
+          <button
+            id="decrement"
+            on:click={() => $shoppingCart['pancakeSausageMeal']['count']--}>-</button>
+          <button
+            id="increment"
+            on:click={() => $shoppingCart['pancakeSausageMeal']['count']++}>+</button>
+          <button
+            id="isLarge"
+            on:click={() => ($shoppingCart['pancakeSausageMeal']['isLarge'] = Math.abs($shoppingCart['pancakeSausageMeal']['isLarge'] - 1))}>SuperSize!</button>
+        </div>
+      {/if}
+    </div>
   </div>
 </div>

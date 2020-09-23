@@ -4,6 +4,7 @@ var app = (function () {
     'use strict';
 
     function noop() { }
+    const identity = x => x;
     function add_location(element, file, line, column, char) {
         element.__svelte_meta = {
             loc: { file, line, column, char }
@@ -47,6 +48,41 @@ var app = (function () {
         return ret;
     }
 
+    const is_client = typeof window !== 'undefined';
+    let now = is_client
+        ? () => window.performance.now()
+        : () => Date.now();
+    let raf = is_client ? cb => requestAnimationFrame(cb) : noop;
+
+    const tasks = new Set();
+    function run_tasks(now) {
+        tasks.forEach(task => {
+            if (!task.c(now)) {
+                tasks.delete(task);
+                task.f();
+            }
+        });
+        if (tasks.size !== 0)
+            raf(run_tasks);
+    }
+    /**
+     * Creates a new task that runs on each raf frame
+     * until it returns a falsy value or is aborted
+     */
+    function loop(callback) {
+        let task;
+        if (tasks.size === 0)
+            raf(run_tasks);
+        return {
+            promise: new Promise(fulfill => {
+                tasks.add(task = { c: callback, f: fulfill });
+            }),
+            abort() {
+                tasks.delete(task);
+            }
+        };
+    }
+
     function append(target, node) {
         target.appendChild(node);
     }
@@ -82,6 +118,67 @@ var app = (function () {
         const e = document.createEvent('CustomEvent');
         e.initCustomEvent(type, false, false, detail);
         return e;
+    }
+
+    const active_docs = new Set();
+    let active = 0;
+    // https://github.com/darkskyapp/string-hash/blob/master/index.js
+    function hash(str) {
+        let hash = 5381;
+        let i = str.length;
+        while (i--)
+            hash = ((hash << 5) - hash) ^ str.charCodeAt(i);
+        return hash >>> 0;
+    }
+    function create_rule(node, a, b, duration, delay, ease, fn, uid = 0) {
+        const step = 16.666 / duration;
+        let keyframes = '{\n';
+        for (let p = 0; p <= 1; p += step) {
+            const t = a + (b - a) * ease(p);
+            keyframes += p * 100 + `%{${fn(t, 1 - t)}}\n`;
+        }
+        const rule = keyframes + `100% {${fn(b, 1 - b)}}\n}`;
+        const name = `__svelte_${hash(rule)}_${uid}`;
+        const doc = node.ownerDocument;
+        active_docs.add(doc);
+        const stylesheet = doc.__svelte_stylesheet || (doc.__svelte_stylesheet = doc.head.appendChild(element('style')).sheet);
+        const current_rules = doc.__svelte_rules || (doc.__svelte_rules = {});
+        if (!current_rules[name]) {
+            current_rules[name] = true;
+            stylesheet.insertRule(`@keyframes ${name} ${rule}`, stylesheet.cssRules.length);
+        }
+        const animation = node.style.animation || '';
+        node.style.animation = `${animation ? `${animation}, ` : ``}${name} ${duration}ms linear ${delay}ms 1 both`;
+        active += 1;
+        return name;
+    }
+    function delete_rule(node, name) {
+        const previous = (node.style.animation || '').split(', ');
+        const next = previous.filter(name
+            ? anim => anim.indexOf(name) < 0 // remove specific animation
+            : anim => anim.indexOf('__svelte') === -1 // remove all Svelte animations
+        );
+        const deleted = previous.length - next.length;
+        if (deleted) {
+            node.style.animation = next.join(', ');
+            active -= deleted;
+            if (!active)
+                clear_rules();
+        }
+    }
+    function clear_rules() {
+        raf(() => {
+            if (active)
+                return;
+            active_docs.forEach(doc => {
+                const stylesheet = doc.__svelte_stylesheet;
+                let i = stylesheet.cssRules.length;
+                while (i--)
+                    stylesheet.deleteRule(i);
+                doc.__svelte_rules = {};
+            });
+            active_docs.clear();
+        });
     }
 
     let current_component;
@@ -152,12 +249,89 @@ var app = (function () {
             $$.after_update.forEach(add_render_callback);
         }
     }
+
+    let promise;
+    function wait() {
+        if (!promise) {
+            promise = Promise.resolve();
+            promise.then(() => {
+                promise = null;
+            });
+        }
+        return promise;
+    }
+    function dispatch(node, direction, kind) {
+        node.dispatchEvent(custom_event(`${direction ? 'intro' : 'outro'}${kind}`));
+    }
     const outroing = new Set();
     function transition_in(block, local) {
         if (block && block.i) {
             outroing.delete(block);
             block.i(local);
         }
+    }
+    const null_transition = { duration: 0 };
+    function create_in_transition(node, fn, params) {
+        let config = fn(node, params);
+        let running = false;
+        let animation_name;
+        let task;
+        let uid = 0;
+        function cleanup() {
+            if (animation_name)
+                delete_rule(node, animation_name);
+        }
+        function go() {
+            const { delay = 0, duration = 300, easing = identity, tick = noop, css } = config || null_transition;
+            if (css)
+                animation_name = create_rule(node, 0, 1, duration, delay, easing, css, uid++);
+            tick(0, 1);
+            const start_time = now() + delay;
+            const end_time = start_time + duration;
+            if (task)
+                task.abort();
+            running = true;
+            add_render_callback(() => dispatch(node, true, 'start'));
+            task = loop(now => {
+                if (running) {
+                    if (now >= end_time) {
+                        tick(1, 0);
+                        dispatch(node, true, 'end');
+                        cleanup();
+                        return running = false;
+                    }
+                    if (now >= start_time) {
+                        const t = easing((now - start_time) / duration);
+                        tick(t, 1 - t);
+                    }
+                }
+                return running;
+            });
+        }
+        let started = false;
+        return {
+            start() {
+                if (started)
+                    return;
+                delete_rule(node);
+                if (is_function(config)) {
+                    config = config();
+                    wait().then(go);
+                }
+                else {
+                    go();
+                }
+            },
+            invalidate() {
+                started = false;
+            },
+            end() {
+                if (running) {
+                    cleanup();
+                    running = false;
+                }
+            }
+        };
     }
 
     const globals = (typeof window !== 'undefined'
@@ -412,12 +586,41 @@ var app = (function () {
       pancakeSausageMeal: { count: 0, price: 3.69, isLarge: 0 },
     });
 
+    function cubicOut(t) {
+        const f = t - 1.0;
+        return f * f * f + 1.0;
+    }
+
+    function fade(node, { delay = 0, duration = 400, easing = identity }) {
+        const o = +getComputedStyle(node).opacity;
+        return {
+            delay,
+            duration,
+            easing,
+            css: t => `opacity: ${t * o}`
+        };
+    }
+    function fly(node, { delay = 0, duration = 400, easing = cubicOut, x = 0, y = 0, opacity = 0 }) {
+        const style = getComputedStyle(node);
+        const target_opacity = +style.opacity;
+        const transform = style.transform === 'none' ? '' : style.transform;
+        const od = target_opacity * (1 - opacity);
+        return {
+            delay,
+            duration,
+            easing,
+            css: (t, u) => `
+			transform: ${transform} translate(${(1 - t) * x}px, ${(1 - t) * y}px);
+			opacity: ${target_opacity - (od * u)}`
+        };
+    }
+
     /* src/App.svelte generated by Svelte v3.26.0 */
 
     const { console: console_1 } = globals;
     const file = "src/App.svelte";
 
-    // (121:47) 
+    // (166:47) 
     function create_if_block_8(ctx) {
     	let div2;
     	let h2;
@@ -428,20 +631,22 @@ var app = (function () {
     	let p0;
     	let t5;
     	let p1;
-    	let t6_value = Math.trunc(/*$shoppingCart*/ ctx[0].pancakeSausageSyrup.price * 100) / 100 + "";
     	let t6;
+    	let t7_value = Math.trunc(/*$shoppingCart*/ ctx[0].pancakeSausageSyrup.price * 100) / 100 + "";
     	let t7;
+    	let t8;
     	let button0;
-    	let t9;
+    	let t10;
     	let div1;
     	let h31;
-    	let t11;
+    	let t12;
     	let p2;
-    	let t13;
-    	let p3;
-    	let t14_value = Math.trunc(/*$shoppingCart*/ ctx[0].pancakeSausageMeal.price * 100) / 100 + "";
     	let t14;
+    	let p3;
     	let t15;
+    	let t16_value = Math.trunc(/*$shoppingCart*/ ctx[0].pancakeSausageMeal.price * 100) / 100 + "";
+    	let t16;
+    	let t17;
     	let button1;
     	let mounted;
     	let dispose;
@@ -460,38 +665,43 @@ var app = (function () {
     			p0.textContent = "For nutritional and allergen information for our food please visit\n            http://mcdonalds.co.uk/nutrition.";
     			t5 = space();
     			p1 = element("p");
-    			t6 = text(t6_value);
-    			t7 = space();
+    			t6 = text("£");
+    			t7 = text(t7_value);
+    			t8 = space();
     			button0 = element("button");
     			button0.textContent = "ADD\n            TO CART";
-    			t9 = space();
+    			t10 = space();
     			div1 = element("div");
     			h31 = element("h3");
     			h31.textContent = "Pancakes & Sausage Meal";
-    			t11 = space();
+    			t12 = space();
     			p2 = element("p");
     			p2.textContent = "For nutritional and allergen information for our food please visit\n            http://mcdonalds.co.uk/nutrition.";
-    			t13 = space();
+    			t14 = space();
     			p3 = element("p");
-    			t14 = text(t14_value);
-    			t15 = space();
+    			t15 = text("£");
+    			t16 = text(t16_value);
+    			t17 = space();
     			button1 = element("button");
     			button1.textContent = "ADD\n            TO CART";
-    			add_location(h2, file, 122, 8, 3648);
-    			add_location(h30, file, 124, 10, 3698);
-    			add_location(p0, file, 125, 10, 3747);
-    			add_location(p1, file, 129, 10, 3901);
+    			attr_dev(h2, "class", "svelte-17asmgu");
+    			add_location(h2, file, 167, 8, 4313);
+    			attr_dev(h30, "class", "svelte-17asmgu");
+    			add_location(h30, file, 169, 10, 4363);
+    			add_location(p0, file, 170, 10, 4412);
+    			add_location(p1, file, 174, 10, 4566);
     			attr_dev(button0, "id", "pancakeSausageSyrup");
-    			add_location(button0, file, 133, 10, 4049);
-    			add_location(div0, file, 123, 8, 3682);
-    			add_location(h31, file, 140, 10, 4271);
-    			add_location(p2, file, 141, 10, 4314);
-    			add_location(p3, file, 145, 10, 4468);
+    			add_location(button0, file, 178, 10, 4715);
+    			add_location(div0, file, 168, 8, 4347);
+    			attr_dev(h31, "class", "svelte-17asmgu");
+    			add_location(h31, file, 185, 10, 4937);
+    			add_location(p2, file, 186, 10, 4980);
+    			add_location(p3, file, 190, 10, 5134);
     			attr_dev(button1, "id", "pancakeSausageMeal");
-    			add_location(button1, file, 149, 10, 4615);
+    			add_location(button1, file, 194, 10, 5282);
     			attr_dev(div1, "class", "pancakeSausageMeal");
-    			add_location(div1, file, 139, 8, 4228);
-    			add_location(div2, file, 121, 6, 3634);
+    			add_location(div1, file, 184, 8, 4894);
+    			add_location(div2, file, 166, 6, 4299);
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, div2, anchor);
@@ -504,17 +714,19 @@ var app = (function () {
     			append_dev(div0, t5);
     			append_dev(div0, p1);
     			append_dev(p1, t6);
-    			append_dev(div0, t7);
+    			append_dev(p1, t7);
+    			append_dev(div0, t8);
     			append_dev(div0, button0);
-    			append_dev(div2, t9);
+    			append_dev(div2, t10);
     			append_dev(div2, div1);
     			append_dev(div1, h31);
-    			append_dev(div1, t11);
+    			append_dev(div1, t12);
     			append_dev(div1, p2);
-    			append_dev(div1, t13);
+    			append_dev(div1, t14);
     			append_dev(div1, p3);
-    			append_dev(p3, t14);
-    			append_dev(div1, t15);
+    			append_dev(p3, t15);
+    			append_dev(p3, t16);
+    			append_dev(div1, t17);
     			append_dev(div1, button1);
 
     			if (!mounted) {
@@ -527,8 +739,8 @@ var app = (function () {
     			}
     		},
     		p: function update(ctx, dirty) {
-    			if (dirty & /*$shoppingCart*/ 1 && t6_value !== (t6_value = Math.trunc(/*$shoppingCart*/ ctx[0].pancakeSausageSyrup.price * 100) / 100 + "")) set_data_dev(t6, t6_value);
-    			if (dirty & /*$shoppingCart*/ 1 && t14_value !== (t14_value = Math.trunc(/*$shoppingCart*/ ctx[0].pancakeSausageMeal.price * 100) / 100 + "")) set_data_dev(t14, t14_value);
+    			if (dirty & /*$shoppingCart*/ 1 && t7_value !== (t7_value = Math.trunc(/*$shoppingCart*/ ctx[0].pancakeSausageSyrup.price * 100) / 100 + "")) set_data_dev(t7, t7_value);
+    			if (dirty & /*$shoppingCart*/ 1 && t16_value !== (t16_value = Math.trunc(/*$shoppingCart*/ ctx[0].pancakeSausageMeal.price * 100) / 100 + "")) set_data_dev(t16, t16_value);
     		},
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(div2);
@@ -541,14 +753,14 @@ var app = (function () {
     		block,
     		id: create_if_block_8.name,
     		type: "if",
-    		source: "(121:47) ",
+    		source: "(166:47) ",
     		ctx
     	});
 
     	return block;
     }
 
-    // (86:44) 
+    // (131:44) 
     function create_if_block_7(ctx) {
     	let div2;
     	let h2;
@@ -559,20 +771,22 @@ var app = (function () {
     	let p0;
     	let t5;
     	let p1;
-    	let t6_value = Math.trunc(/*$shoppingCart*/ ctx[0].baconBrownSauce.price * 100) / 100 + "";
     	let t6;
+    	let t7_value = Math.trunc(/*$shoppingCart*/ ctx[0].baconBrownSauce.price * 100) / 100 + "";
     	let t7;
+    	let t8;
     	let button0;
-    	let t9;
+    	let t10;
     	let div1;
     	let h31;
-    	let t11;
+    	let t12;
     	let p2;
-    	let t13;
-    	let p3;
-    	let t14_value = Math.trunc(/*$shoppingCart*/ ctx[0].baconBrownSauceMeal.price * 100) / 100 + "";
     	let t14;
+    	let p3;
     	let t15;
+    	let t16_value = Math.trunc(/*$shoppingCart*/ ctx[0].baconBrownSauceMeal.price * 100) / 100 + "";
+    	let t16;
+    	let t17;
     	let button1;
     	let mounted;
     	let dispose;
@@ -591,38 +805,43 @@ var app = (function () {
     			p0.textContent = "For nutritional and allergen information for our food please visit\n            http://mcdonalds.co.uk/nutrition.";
     			t5 = space();
     			p1 = element("p");
-    			t6 = text(t6_value);
-    			t7 = space();
+    			t6 = text("£");
+    			t7 = text(t7_value);
+    			t8 = space();
     			button0 = element("button");
     			button0.textContent = "ADD TO\n            CART";
-    			t9 = space();
+    			t10 = space();
     			div1 = element("div");
     			h31 = element("h3");
     			h31.textContent = "Bacon Roll with Brown Sauce Meal";
-    			t11 = space();
+    			t12 = space();
     			p2 = element("p");
     			p2.textContent = "For nutritional and allergen information for our food please visit\n            http://mcdonalds.co.uk/nutrition.";
-    			t13 = space();
+    			t14 = space();
     			p3 = element("p");
-    			t14 = text(t14_value);
-    			t15 = space();
+    			t15 = text("£");
+    			t16 = text(t16_value);
+    			t17 = space();
     			button1 = element("button");
     			button1.textContent = "ADD\n            TO CART";
-    			add_location(h2, file, 87, 8, 2436);
-    			add_location(h30, file, 89, 10, 2483);
-    			add_location(p0, file, 90, 10, 2530);
-    			add_location(p1, file, 94, 10, 2684);
+    			attr_dev(h2, "class", "svelte-17asmgu");
+    			add_location(h2, file, 132, 8, 3099);
+    			attr_dev(h30, "class", "svelte-17asmgu");
+    			add_location(h30, file, 134, 10, 3146);
+    			add_location(p0, file, 135, 10, 3193);
+    			add_location(p1, file, 139, 10, 3347);
     			attr_dev(button0, "id", "baconBrownSauce");
-    			add_location(button0, file, 98, 10, 2828);
-    			add_location(div0, file, 88, 8, 2467);
-    			add_location(h31, file, 105, 10, 3043);
-    			add_location(p2, file, 106, 10, 3095);
-    			add_location(p3, file, 110, 10, 3249);
+    			add_location(button0, file, 143, 10, 3492);
+    			add_location(div0, file, 133, 8, 3130);
+    			attr_dev(h31, "class", "svelte-17asmgu");
+    			add_location(h31, file, 150, 10, 3707);
+    			add_location(p2, file, 151, 10, 3759);
+    			add_location(p3, file, 155, 10, 3913);
     			attr_dev(button1, "id", "baconBrownSauceMeal");
-    			add_location(button1, file, 114, 10, 3397);
+    			add_location(button1, file, 159, 10, 4062);
     			attr_dev(div1, "class", "baconBrownSauceMeal");
-    			add_location(div1, file, 104, 8, 2999);
-    			add_location(div2, file, 86, 6, 2422);
+    			add_location(div1, file, 149, 8, 3663);
+    			add_location(div2, file, 131, 6, 3085);
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, div2, anchor);
@@ -635,17 +854,19 @@ var app = (function () {
     			append_dev(div0, t5);
     			append_dev(div0, p1);
     			append_dev(p1, t6);
-    			append_dev(div0, t7);
+    			append_dev(p1, t7);
+    			append_dev(div0, t8);
     			append_dev(div0, button0);
-    			append_dev(div2, t9);
+    			append_dev(div2, t10);
     			append_dev(div2, div1);
     			append_dev(div1, h31);
-    			append_dev(div1, t11);
+    			append_dev(div1, t12);
     			append_dev(div1, p2);
-    			append_dev(div1, t13);
+    			append_dev(div1, t14);
     			append_dev(div1, p3);
-    			append_dev(p3, t14);
-    			append_dev(div1, t15);
+    			append_dev(p3, t15);
+    			append_dev(p3, t16);
+    			append_dev(div1, t17);
     			append_dev(div1, button1);
 
     			if (!mounted) {
@@ -658,8 +879,8 @@ var app = (function () {
     			}
     		},
     		p: function update(ctx, dirty) {
-    			if (dirty & /*$shoppingCart*/ 1 && t6_value !== (t6_value = Math.trunc(/*$shoppingCart*/ ctx[0].baconBrownSauce.price * 100) / 100 + "")) set_data_dev(t6, t6_value);
-    			if (dirty & /*$shoppingCart*/ 1 && t14_value !== (t14_value = Math.trunc(/*$shoppingCart*/ ctx[0].baconBrownSauceMeal.price * 100) / 100 + "")) set_data_dev(t14, t14_value);
+    			if (dirty & /*$shoppingCart*/ 1 && t7_value !== (t7_value = Math.trunc(/*$shoppingCart*/ ctx[0].baconBrownSauce.price * 100) / 100 + "")) set_data_dev(t7, t7_value);
+    			if (dirty & /*$shoppingCart*/ 1 && t16_value !== (t16_value = Math.trunc(/*$shoppingCart*/ ctx[0].baconBrownSauceMeal.price * 100) / 100 + "")) set_data_dev(t16, t16_value);
     		},
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(div2);
@@ -672,14 +893,14 @@ var app = (function () {
     		block,
     		id: create_if_block_7.name,
     		type: "if",
-    		source: "(86:44) ",
+    		source: "(131:44) ",
     		ctx
     	});
 
     	return block;
     }
 
-    // (51:4) {#if $shoppingCategory === 'mcmuffins'}
+    // (96:4) {#if $shoppingCategory === 'mcmuffins'}
     function create_if_block_6(ctx) {
     	let div2;
     	let h2;
@@ -690,20 +911,22 @@ var app = (function () {
     	let p0;
     	let t5;
     	let p1;
-    	let t6_value = Math.trunc(/*$shoppingCart*/ ctx[0].doubleSausageMcmuffin.price * 100) / 100 + "";
     	let t6;
+    	let t7_value = Math.trunc(/*$shoppingCart*/ ctx[0].doubleSausageMcmuffin.price * 100) / 100 + "";
     	let t7;
+    	let t8;
     	let button0;
-    	let t9;
+    	let t10;
     	let div1;
     	let h31;
-    	let t11;
+    	let t12;
     	let p2;
-    	let t13;
-    	let p3;
-    	let t14_value = Math.trunc(/*$shoppingCart*/ ctx[0].doubleSausageMcmuffinMeal.price * 100) / 100 + "";
     	let t14;
+    	let p3;
     	let t15;
+    	let t16_value = Math.trunc(/*$shoppingCart*/ ctx[0].doubleSausageMcmuffinMeal.price * 100) / 100 + "";
+    	let t16;
+    	let t17;
     	let button1;
     	let mounted;
     	let dispose;
@@ -722,39 +945,44 @@ var app = (function () {
     			p0.textContent = "For nutritional and allergen information for our food please visit\n            http://mcdonalds.co.uk/nutrition.";
     			t5 = space();
     			p1 = element("p");
-    			t6 = text(t6_value);
-    			t7 = space();
+    			t6 = text("£");
+    			t7 = text(t7_value);
+    			t8 = space();
     			button0 = element("button");
     			button0.textContent = "ADD\n            TO CART";
-    			t9 = space();
+    			t10 = space();
     			div1 = element("div");
     			h31 = element("h3");
     			h31.textContent = "Double Sausage Egg McMuffin® Meal";
-    			t11 = space();
+    			t12 = space();
     			p2 = element("p");
     			p2.textContent = "For nutritional and allergen information for our food please visit\n            http://mcdonalds.co.uk/nutrition.";
-    			t13 = space();
+    			t14 = space();
     			p3 = element("p");
-    			t14 = text(t14_value);
-    			t15 = space();
+    			t15 = text("£");
+    			t16 = text(t16_value);
+    			t17 = space();
     			button1 = element("button");
     			button1.textContent = "ADD\n            TO CART";
-    			add_location(h2, file, 52, 8, 1175);
-    			add_location(h30, file, 54, 10, 1226);
-    			add_location(p0, file, 55, 10, 1278);
-    			add_location(p1, file, 59, 10, 1432);
+    			attr_dev(h2, "class", "svelte-17asmgu");
+    			add_location(h2, file, 97, 8, 1836);
+    			attr_dev(h30, "class", "svelte-17asmgu");
+    			add_location(h30, file, 99, 10, 1887);
+    			add_location(p0, file, 100, 10, 1939);
+    			add_location(p1, file, 104, 10, 2093);
     			attr_dev(button0, "id", "doubleSausageMcmuffin");
-    			add_location(button0, file, 63, 10, 1582);
-    			add_location(div0, file, 53, 8, 1210);
-    			add_location(h31, file, 70, 10, 1815);
-    			add_location(p2, file, 71, 10, 1868);
-    			add_location(p3, file, 75, 10, 2022);
+    			add_location(button0, file, 108, 10, 2244);
+    			add_location(div0, file, 98, 8, 1871);
+    			attr_dev(h31, "class", "svelte-17asmgu");
+    			add_location(h31, file, 115, 10, 2477);
+    			add_location(p2, file, 116, 10, 2530);
+    			add_location(p3, file, 120, 10, 2684);
     			attr_dev(button1, "id", "doubleSausageMcmuffinMeal");
-    			add_location(button1, file, 79, 10, 2176);
+    			add_location(button1, file, 124, 10, 2839);
     			attr_dev(div1, "class", "doubleSausageMcmuffinMeal");
-    			add_location(div1, file, 69, 8, 1765);
+    			add_location(div1, file, 114, 8, 2427);
     			attr_dev(div2, "class", "doubleSausageMcmuffin");
-    			add_location(div2, file, 51, 6, 1131);
+    			add_location(div2, file, 96, 6, 1792);
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, div2, anchor);
@@ -767,17 +995,19 @@ var app = (function () {
     			append_dev(div0, t5);
     			append_dev(div0, p1);
     			append_dev(p1, t6);
-    			append_dev(div0, t7);
+    			append_dev(p1, t7);
+    			append_dev(div0, t8);
     			append_dev(div0, button0);
-    			append_dev(div2, t9);
+    			append_dev(div2, t10);
     			append_dev(div2, div1);
     			append_dev(div1, h31);
-    			append_dev(div1, t11);
+    			append_dev(div1, t12);
     			append_dev(div1, p2);
-    			append_dev(div1, t13);
+    			append_dev(div1, t14);
     			append_dev(div1, p3);
-    			append_dev(p3, t14);
-    			append_dev(div1, t15);
+    			append_dev(p3, t15);
+    			append_dev(p3, t16);
+    			append_dev(div1, t17);
     			append_dev(div1, button1);
 
     			if (!mounted) {
@@ -790,8 +1020,8 @@ var app = (function () {
     			}
     		},
     		p: function update(ctx, dirty) {
-    			if (dirty & /*$shoppingCart*/ 1 && t6_value !== (t6_value = Math.trunc(/*$shoppingCart*/ ctx[0].doubleSausageMcmuffin.price * 100) / 100 + "")) set_data_dev(t6, t6_value);
-    			if (dirty & /*$shoppingCart*/ 1 && t14_value !== (t14_value = Math.trunc(/*$shoppingCart*/ ctx[0].doubleSausageMcmuffinMeal.price * 100) / 100 + "")) set_data_dev(t14, t14_value);
+    			if (dirty & /*$shoppingCart*/ 1 && t7_value !== (t7_value = Math.trunc(/*$shoppingCart*/ ctx[0].doubleSausageMcmuffin.price * 100) / 100 + "")) set_data_dev(t7, t7_value);
+    			if (dirty & /*$shoppingCart*/ 1 && t16_value !== (t16_value = Math.trunc(/*$shoppingCart*/ ctx[0].doubleSausageMcmuffinMeal.price * 100) / 100 + "")) set_data_dev(t16, t16_value);
     		},
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(div2);
@@ -804,16 +1034,17 @@ var app = (function () {
     		block,
     		id: create_if_block_6.name,
     		type: "if",
-    		source: "(51:4) {#if $shoppingCategory === 'mcmuffins'}",
+    		source: "(96:4) {#if $shoppingCategory === 'mcmuffins'}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (160:18) {#if $shoppingCart.doubleSausageMcmuffin.count}
+    // (207:6) {#if $shoppingCart.doubleSausageMcmuffin.count}
     function create_if_block_5(ctx) {
-    	let p;
+    	let div;
+    	let h3;
     	let t1;
     	let t2_value = /*$shoppingCart*/ ctx[0].doubleSausageMcmuffin.count + "";
     	let t2;
@@ -826,16 +1057,18 @@ var app = (function () {
     	let button1;
     	let t9;
     	let button2;
+    	let div_intro;
     	let mounted;
     	let dispose;
 
     	const block = {
     		c: function create() {
-    			p = element("p");
-    			p.textContent = "Double Sausage and Egg McMuffin®";
-    			t1 = space();
+    			div = element("div");
+    			h3 = element("h3");
+    			h3.textContent = "Double Sausage and Egg McMuffin®";
+    			t1 = text("\n          x");
     			t2 = text(t2_value);
-    			t3 = space();
+    			t3 = text("\n          \n          £");
     			t4 = text(t4_value);
     			t5 = space();
     			button0 = element("button");
@@ -846,26 +1079,33 @@ var app = (function () {
     			t9 = space();
     			button2 = element("button");
     			button2.textContent = "SuperSize!";
-    			add_location(p, file, 160, 6, 4923);
+    			attr_dev(h3, "class", "svelte-17asmgu");
+    			add_location(h3, file, 208, 10, 5718);
     			attr_dev(button0, "id", "decrement");
-    			add_location(button0, file, 164, 6, 5262);
+    			attr_dev(button0, "class", "svelte-17asmgu");
+    			add_location(button0, file, 212, 10, 6077);
     			attr_dev(button1, "id", "increment");
-    			add_location(button1, file, 167, 6, 5385);
+    			attr_dev(button1, "class", "svelte-17asmgu");
+    			add_location(button1, file, 215, 10, 6212);
     			attr_dev(button2, "id", "isLarge");
-    			add_location(button2, file, 170, 6, 5508);
+    			attr_dev(button2, "class", "svelte-17asmgu");
+    			add_location(button2, file, 218, 10, 6347);
+    			attr_dev(div, "class", "checkout-item");
+    			add_location(div, file, 207, 8, 5645);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, p, anchor);
-    			insert_dev(target, t1, anchor);
-    			insert_dev(target, t2, anchor);
-    			insert_dev(target, t3, anchor);
-    			insert_dev(target, t4, anchor);
-    			insert_dev(target, t5, anchor);
-    			insert_dev(target, button0, anchor);
-    			insert_dev(target, t7, anchor);
-    			insert_dev(target, button1, anchor);
-    			insert_dev(target, t9, anchor);
-    			insert_dev(target, button2, anchor);
+    			insert_dev(target, div, anchor);
+    			append_dev(div, h3);
+    			append_dev(div, t1);
+    			append_dev(div, t2);
+    			append_dev(div, t3);
+    			append_dev(div, t4);
+    			append_dev(div, t5);
+    			append_dev(div, button0);
+    			append_dev(div, t7);
+    			append_dev(div, button1);
+    			append_dev(div, t9);
+    			append_dev(div, button2);
 
     			if (!mounted) {
     				dispose = [
@@ -881,18 +1121,17 @@ var app = (function () {
     			if (dirty & /*$shoppingCart*/ 1 && t2_value !== (t2_value = /*$shoppingCart*/ ctx[0].doubleSausageMcmuffin.count + "")) set_data_dev(t2, t2_value);
     			if (dirty & /*$shoppingCart*/ 1 && t4_value !== (t4_value = Math.trunc(/*$shoppingCart*/ ctx[0].doubleSausageMcmuffin.price * /*$shoppingCart*/ ctx[0].doubleSausageMcmuffin.count * 100) / 100 + /*$shoppingCart*/ ctx[0].doubleSausageMcmuffin.isLarge * /*$shoppingCart*/ ctx[0].doubleSausageMcmuffin.count + "")) set_data_dev(t4, t4_value);
     		},
+    		i: function intro(local) {
+    			if (!div_intro) {
+    				add_render_callback(() => {
+    					div_intro = create_in_transition(div, fly, { y: 200, duration: 500 });
+    					div_intro.start();
+    				});
+    			}
+    		},
+    		o: noop,
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(p);
-    			if (detaching) detach_dev(t1);
-    			if (detaching) detach_dev(t2);
-    			if (detaching) detach_dev(t3);
-    			if (detaching) detach_dev(t4);
-    			if (detaching) detach_dev(t5);
-    			if (detaching) detach_dev(button0);
-    			if (detaching) detach_dev(t7);
-    			if (detaching) detach_dev(button1);
-    			if (detaching) detach_dev(t9);
-    			if (detaching) detach_dev(button2);
+    			if (detaching) detach_dev(div);
     			mounted = false;
     			run_all(dispose);
     		}
@@ -902,16 +1141,17 @@ var app = (function () {
     		block,
     		id: create_if_block_5.name,
     		type: "if",
-    		source: "(160:18) {#if $shoppingCart.doubleSausageMcmuffin.count}",
+    		source: "(207:6) {#if $shoppingCart.doubleSausageMcmuffin.count}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (175:4) {#if $shoppingCart.doubleSausageMcmuffinMeal.count}
+    // (224:6) {#if $shoppingCart.doubleSausageMcmuffinMeal.count}
     function create_if_block_4(ctx) {
-    	let p;
+    	let div;
+    	let h3;
     	let t1;
     	let t2_value = /*$shoppingCart*/ ctx[0].doubleSausageMcmuffinMeal.count + "";
     	let t2;
@@ -924,16 +1164,18 @@ var app = (function () {
     	let button1;
     	let t9;
     	let button2;
+    	let div_intro;
     	let mounted;
     	let dispose;
 
     	const block = {
     		c: function create() {
-    			p = element("p");
-    			p.textContent = "Double Sausage and Egg McMuffin®";
-    			t1 = space();
+    			div = element("div");
+    			h3 = element("h3");
+    			h3.textContent = "Double Sausage and Egg McMuffin®";
+    			t1 = text("\n          x");
     			t2 = text(t2_value);
-    			t3 = space();
+    			t3 = text("\n          \n          \n          £");
     			t4 = text(t4_value);
     			t5 = space();
     			button0 = element("button");
@@ -944,27 +1186,33 @@ var app = (function () {
     			t9 = space();
     			button2 = element("button");
     			button2.textContent = "SuperSize!";
-    			add_location(p, file, 175, 6, 5772);
-    			attr_dev(button0, "class", "decrement-button");
+    			attr_dev(h3, "class", "svelte-17asmgu");
+    			add_location(h3, file, 225, 10, 6713);
+    			attr_dev(button0, "class", "decrement-button svelte-17asmgu");
     			attr_dev(button0, "id", "decrement");
-    			add_location(button0, file, 180, 6, 6152);
+    			add_location(button0, file, 230, 10, 7117);
     			attr_dev(button1, "id", "increment");
-    			add_location(button1, file, 184, 6, 6312);
+    			attr_dev(button1, "class", "svelte-17asmgu");
+    			add_location(button1, file, 234, 10, 7293);
     			attr_dev(button2, "id", "isLarge");
-    			add_location(button2, file, 187, 6, 6439);
+    			attr_dev(button2, "class", "svelte-17asmgu");
+    			add_location(button2, file, 237, 10, 7432);
+    			attr_dev(div, "class", "checkout-item");
+    			add_location(div, file, 224, 8, 6640);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, p, anchor);
-    			insert_dev(target, t1, anchor);
-    			insert_dev(target, t2, anchor);
-    			insert_dev(target, t3, anchor);
-    			insert_dev(target, t4, anchor);
-    			insert_dev(target, t5, anchor);
-    			insert_dev(target, button0, anchor);
-    			insert_dev(target, t7, anchor);
-    			insert_dev(target, button1, anchor);
-    			insert_dev(target, t9, anchor);
-    			insert_dev(target, button2, anchor);
+    			insert_dev(target, div, anchor);
+    			append_dev(div, h3);
+    			append_dev(div, t1);
+    			append_dev(div, t2);
+    			append_dev(div, t3);
+    			append_dev(div, t4);
+    			append_dev(div, t5);
+    			append_dev(div, button0);
+    			append_dev(div, t7);
+    			append_dev(div, button1);
+    			append_dev(div, t9);
+    			append_dev(div, button2);
 
     			if (!mounted) {
     				dispose = [
@@ -980,18 +1228,17 @@ var app = (function () {
     			if (dirty & /*$shoppingCart*/ 1 && t2_value !== (t2_value = /*$shoppingCart*/ ctx[0].doubleSausageMcmuffinMeal.count + "")) set_data_dev(t2, t2_value);
     			if (dirty & /*$shoppingCart*/ 1 && t4_value !== (t4_value = Math.trunc(/*$shoppingCart*/ ctx[0].doubleSausageMcmuffinMeal.price * /*$shoppingCart*/ ctx[0].doubleSausageMcmuffinMeal.count * 100) / 100 + /*$shoppingCart*/ ctx[0].doubleSausageMcmuffinMeal.isLarge * /*$shoppingCart*/ ctx[0].doubleSausageMcmuffinMeal.count + "")) set_data_dev(t4, t4_value);
     		},
+    		i: function intro(local) {
+    			if (!div_intro) {
+    				add_render_callback(() => {
+    					div_intro = create_in_transition(div, fly, { y: 200, duration: 500 });
+    					div_intro.start();
+    				});
+    			}
+    		},
+    		o: noop,
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(p);
-    			if (detaching) detach_dev(t1);
-    			if (detaching) detach_dev(t2);
-    			if (detaching) detach_dev(t3);
-    			if (detaching) detach_dev(t4);
-    			if (detaching) detach_dev(t5);
-    			if (detaching) detach_dev(button0);
-    			if (detaching) detach_dev(t7);
-    			if (detaching) detach_dev(button1);
-    			if (detaching) detach_dev(t9);
-    			if (detaching) detach_dev(button2);
+    			if (detaching) detach_dev(div);
     			mounted = false;
     			run_all(dispose);
     		}
@@ -1001,16 +1248,17 @@ var app = (function () {
     		block,
     		id: create_if_block_4.name,
     		type: "if",
-    		source: "(175:4) {#if $shoppingCart.doubleSausageMcmuffinMeal.count}",
+    		source: "(224:6) {#if $shoppingCart.doubleSausageMcmuffinMeal.count}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (192:4) {#if $shoppingCart.baconBrownSauce.count}
+    // (243:6) {#if $shoppingCart.baconBrownSauce.count}
     function create_if_block_3(ctx) {
-    	let p;
+    	let div;
+    	let h3;
     	let t1;
     	let t2_value = /*$shoppingCart*/ ctx[0].baconBrownSauce.count + "";
     	let t2;
@@ -1023,16 +1271,18 @@ var app = (function () {
     	let button1;
     	let t9;
     	let button2;
+    	let div_intro;
     	let mounted;
     	let dispose;
 
     	const block = {
     		c: function create() {
-    			p = element("p");
-    			p.textContent = "Bacon Roll with Brown Sauce";
-    			t1 = space();
+    			div = element("div");
+    			h3 = element("h3");
+    			h3.textContent = "Bacon Roll with Brown Sauce";
+    			t1 = text("\n          x");
     			t2 = text(t2_value);
-    			t3 = space();
+    			t3 = text("\n          \n          £");
     			t4 = text(t4_value);
     			t5 = space();
     			button0 = element("button");
@@ -1043,26 +1293,33 @@ var app = (function () {
     			t9 = space();
     			button2 = element("button");
     			button2.textContent = "SuperSize!";
-    			add_location(p, file, 192, 6, 6701);
+    			attr_dev(h3, "class", "svelte-17asmgu");
+    			add_location(h3, file, 244, 10, 7796);
     			attr_dev(button0, "id", "decrement");
-    			add_location(button0, file, 196, 6, 7005);
+    			attr_dev(button0, "class", "svelte-17asmgu");
+    			add_location(button0, file, 248, 10, 8120);
     			attr_dev(button1, "id", "increment");
-    			add_location(button1, file, 199, 6, 7122);
+    			attr_dev(button1, "class", "svelte-17asmgu");
+    			add_location(button1, file, 251, 10, 8249);
     			attr_dev(button2, "id", "isLarge");
-    			add_location(button2, file, 202, 6, 7239);
+    			attr_dev(button2, "class", "svelte-17asmgu");
+    			add_location(button2, file, 254, 10, 8378);
+    			attr_dev(div, "class", "checkout-item");
+    			add_location(div, file, 243, 8, 7723);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, p, anchor);
-    			insert_dev(target, t1, anchor);
-    			insert_dev(target, t2, anchor);
-    			insert_dev(target, t3, anchor);
-    			insert_dev(target, t4, anchor);
-    			insert_dev(target, t5, anchor);
-    			insert_dev(target, button0, anchor);
-    			insert_dev(target, t7, anchor);
-    			insert_dev(target, button1, anchor);
-    			insert_dev(target, t9, anchor);
-    			insert_dev(target, button2, anchor);
+    			insert_dev(target, div, anchor);
+    			append_dev(div, h3);
+    			append_dev(div, t1);
+    			append_dev(div, t2);
+    			append_dev(div, t3);
+    			append_dev(div, t4);
+    			append_dev(div, t5);
+    			append_dev(div, button0);
+    			append_dev(div, t7);
+    			append_dev(div, button1);
+    			append_dev(div, t9);
+    			append_dev(div, button2);
 
     			if (!mounted) {
     				dispose = [
@@ -1078,18 +1335,17 @@ var app = (function () {
     			if (dirty & /*$shoppingCart*/ 1 && t2_value !== (t2_value = /*$shoppingCart*/ ctx[0].baconBrownSauce.count + "")) set_data_dev(t2, t2_value);
     			if (dirty & /*$shoppingCart*/ 1 && t4_value !== (t4_value = Math.trunc(/*$shoppingCart*/ ctx[0].baconBrownSauce.price * /*$shoppingCart*/ ctx[0].baconBrownSauce.count * 100) / 100 + /*$shoppingCart*/ ctx[0].baconBrownSauce.isLarge * /*$shoppingCart*/ ctx[0].baconBrownSauce.count + "")) set_data_dev(t4, t4_value);
     		},
+    		i: function intro(local) {
+    			if (!div_intro) {
+    				add_render_callback(() => {
+    					div_intro = create_in_transition(div, fly, { y: 200, duration: 500 });
+    					div_intro.start();
+    				});
+    			}
+    		},
+    		o: noop,
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(p);
-    			if (detaching) detach_dev(t1);
-    			if (detaching) detach_dev(t2);
-    			if (detaching) detach_dev(t3);
-    			if (detaching) detach_dev(t4);
-    			if (detaching) detach_dev(t5);
-    			if (detaching) detach_dev(button0);
-    			if (detaching) detach_dev(t7);
-    			if (detaching) detach_dev(button1);
-    			if (detaching) detach_dev(t9);
-    			if (detaching) detach_dev(button2);
+    			if (detaching) detach_dev(div);
     			mounted = false;
     			run_all(dispose);
     		}
@@ -1099,16 +1355,17 @@ var app = (function () {
     		block,
     		id: create_if_block_3.name,
     		type: "if",
-    		source: "(192:4) {#if $shoppingCart.baconBrownSauce.count}",
+    		source: "(243:6) {#if $shoppingCart.baconBrownSauce.count}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (207:4) {#if $shoppingCart.baconBrownSauceMeal.count}
+    // (260:6) {#if $shoppingCart.baconBrownSauceMeal.count}
     function create_if_block_2(ctx) {
-    	let p;
+    	let div;
+    	let h3;
     	let t1;
     	let t2_value = /*$shoppingCart*/ ctx[0].baconBrownSauceMeal.count + "";
     	let t2;
@@ -1121,16 +1378,18 @@ var app = (function () {
     	let button1;
     	let t9;
     	let button2;
+    	let div_intro;
     	let mounted;
     	let dispose;
 
     	const block = {
     		c: function create() {
-    			p = element("p");
-    			p.textContent = "Bacon Roll with Brown Sauce Meal";
-    			t1 = space();
+    			div = element("div");
+    			h3 = element("h3");
+    			h3.textContent = "Bacon Roll with Brown Sauce Meal";
+    			t1 = text("\n          x");
     			t2 = text(t2_value);
-    			t3 = space();
+    			t3 = text("\n          \n          \n          £");
     			t4 = text(t4_value);
     			t5 = space();
     			button0 = element("button");
@@ -1141,26 +1400,33 @@ var app = (function () {
     			t9 = space();
     			button2 = element("button");
     			button2.textContent = "SuperSize!";
-    			add_location(p, file, 207, 6, 7485);
+    			attr_dev(h3, "class", "svelte-17asmgu");
+    			add_location(h3, file, 261, 10, 8726);
     			attr_dev(button0, "id", "decrement");
-    			add_location(button0, file, 212, 6, 7835);
+    			attr_dev(button0, "class", "svelte-17asmgu");
+    			add_location(button0, file, 266, 10, 9100);
     			attr_dev(button1, "id", "increment");
-    			add_location(button1, file, 215, 6, 7956);
+    			attr_dev(button1, "class", "svelte-17asmgu");
+    			add_location(button1, file, 269, 10, 9233);
     			attr_dev(button2, "id", "isLarge");
-    			add_location(button2, file, 218, 6, 8077);
+    			attr_dev(button2, "class", "svelte-17asmgu");
+    			add_location(button2, file, 272, 10, 9366);
+    			attr_dev(div, "class", "checkout-item");
+    			add_location(div, file, 260, 8, 8653);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, p, anchor);
-    			insert_dev(target, t1, anchor);
-    			insert_dev(target, t2, anchor);
-    			insert_dev(target, t3, anchor);
-    			insert_dev(target, t4, anchor);
-    			insert_dev(target, t5, anchor);
-    			insert_dev(target, button0, anchor);
-    			insert_dev(target, t7, anchor);
-    			insert_dev(target, button1, anchor);
-    			insert_dev(target, t9, anchor);
-    			insert_dev(target, button2, anchor);
+    			insert_dev(target, div, anchor);
+    			append_dev(div, h3);
+    			append_dev(div, t1);
+    			append_dev(div, t2);
+    			append_dev(div, t3);
+    			append_dev(div, t4);
+    			append_dev(div, t5);
+    			append_dev(div, button0);
+    			append_dev(div, t7);
+    			append_dev(div, button1);
+    			append_dev(div, t9);
+    			append_dev(div, button2);
 
     			if (!mounted) {
     				dispose = [
@@ -1176,18 +1442,17 @@ var app = (function () {
     			if (dirty & /*$shoppingCart*/ 1 && t2_value !== (t2_value = /*$shoppingCart*/ ctx[0].baconBrownSauceMeal.count + "")) set_data_dev(t2, t2_value);
     			if (dirty & /*$shoppingCart*/ 1 && t4_value !== (t4_value = Math.trunc(/*$shoppingCart*/ ctx[0].baconBrownSauceMeal.price * /*$shoppingCart*/ ctx[0].baconBrownSauceMeal.count * 100) / 100 + /*$shoppingCart*/ ctx[0].baconBrownSauceMeal.isLarge * /*$shoppingCart*/ ctx[0].baconBrownSauceMeal.count + "")) set_data_dev(t4, t4_value);
     		},
+    		i: function intro(local) {
+    			if (!div_intro) {
+    				add_render_callback(() => {
+    					div_intro = create_in_transition(div, fly, { y: 200, duration: 500 });
+    					div_intro.start();
+    				});
+    			}
+    		},
+    		o: noop,
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(p);
-    			if (detaching) detach_dev(t1);
-    			if (detaching) detach_dev(t2);
-    			if (detaching) detach_dev(t3);
-    			if (detaching) detach_dev(t4);
-    			if (detaching) detach_dev(t5);
-    			if (detaching) detach_dev(button0);
-    			if (detaching) detach_dev(t7);
-    			if (detaching) detach_dev(button1);
-    			if (detaching) detach_dev(t9);
-    			if (detaching) detach_dev(button2);
+    			if (detaching) detach_dev(div);
     			mounted = false;
     			run_all(dispose);
     		}
@@ -1197,16 +1462,17 @@ var app = (function () {
     		block,
     		id: create_if_block_2.name,
     		type: "if",
-    		source: "(207:4) {#if $shoppingCart.baconBrownSauceMeal.count}",
+    		source: "(260:6) {#if $shoppingCart.baconBrownSauceMeal.count}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (223:4) {#if $shoppingCart.pancakeSausageSyrup.count}
+    // (278:6) {#if $shoppingCart.pancakeSausageSyrup.count}
     function create_if_block_1(ctx) {
-    	let p;
+    	let div;
+    	let h3;
     	let t1;
     	let t2_value = /*$shoppingCart*/ ctx[0].pancakeSausageSyrup.count + "";
     	let t2;
@@ -1219,16 +1485,18 @@ var app = (function () {
     	let button1;
     	let t9;
     	let button2;
+    	let div_intro;
     	let mounted;
     	let dispose;
 
     	const block = {
     		c: function create() {
-    			p = element("p");
-    			p.textContent = "Pancakes & Sausage with Syrup";
-    			t1 = space();
+    			div = element("div");
+    			h3 = element("h3");
+    			h3.textContent = "Pancakes & Sausage with Syrup";
+    			t1 = text("\n          x");
     			t2 = text(t2_value);
-    			t3 = space();
+    			t3 = text("\n          \n          £");
     			t4 = text(t4_value);
     			t5 = space();
     			button0 = element("button");
@@ -1239,26 +1507,33 @@ var app = (function () {
     			t9 = space();
     			button2 = element("button");
     			button2.textContent = "SuperSize!";
-    			add_location(p, file, 223, 6, 8331);
+    			attr_dev(h3, "class", "svelte-17asmgu");
+    			add_location(h3, file, 279, 10, 9722);
     			attr_dev(button0, "id", "decrement");
-    			add_location(button0, file, 227, 6, 8657);
+    			attr_dev(button0, "class", "svelte-17asmgu");
+    			add_location(button0, file, 283, 10, 10068);
     			attr_dev(button1, "id", "increment");
-    			add_location(button1, file, 230, 6, 8778);
+    			attr_dev(button1, "class", "svelte-17asmgu");
+    			add_location(button1, file, 286, 10, 10201);
     			attr_dev(button2, "id", "isLarge");
-    			add_location(button2, file, 233, 6, 8899);
+    			attr_dev(button2, "class", "svelte-17asmgu");
+    			add_location(button2, file, 289, 10, 10334);
+    			attr_dev(div, "class", "checkout-item");
+    			add_location(div, file, 278, 8, 9649);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, p, anchor);
-    			insert_dev(target, t1, anchor);
-    			insert_dev(target, t2, anchor);
-    			insert_dev(target, t3, anchor);
-    			insert_dev(target, t4, anchor);
-    			insert_dev(target, t5, anchor);
-    			insert_dev(target, button0, anchor);
-    			insert_dev(target, t7, anchor);
-    			insert_dev(target, button1, anchor);
-    			insert_dev(target, t9, anchor);
-    			insert_dev(target, button2, anchor);
+    			insert_dev(target, div, anchor);
+    			append_dev(div, h3);
+    			append_dev(div, t1);
+    			append_dev(div, t2);
+    			append_dev(div, t3);
+    			append_dev(div, t4);
+    			append_dev(div, t5);
+    			append_dev(div, button0);
+    			append_dev(div, t7);
+    			append_dev(div, button1);
+    			append_dev(div, t9);
+    			append_dev(div, button2);
 
     			if (!mounted) {
     				dispose = [
@@ -1274,18 +1549,17 @@ var app = (function () {
     			if (dirty & /*$shoppingCart*/ 1 && t2_value !== (t2_value = /*$shoppingCart*/ ctx[0].pancakeSausageSyrup.count + "")) set_data_dev(t2, t2_value);
     			if (dirty & /*$shoppingCart*/ 1 && t4_value !== (t4_value = Math.trunc(/*$shoppingCart*/ ctx[0].pancakeSausageSyrup.price * /*$shoppingCart*/ ctx[0].pancakeSausageSyrup.count * 100) / 100 + /*$shoppingCart*/ ctx[0].pancakeSausageSyrup.isLarge * /*$shoppingCart*/ ctx[0].pancakeSausageSyrup.count + "")) set_data_dev(t4, t4_value);
     		},
+    		i: function intro(local) {
+    			if (!div_intro) {
+    				add_render_callback(() => {
+    					div_intro = create_in_transition(div, fly, { y: 200, duration: 500 });
+    					div_intro.start();
+    				});
+    			}
+    		},
+    		o: noop,
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(p);
-    			if (detaching) detach_dev(t1);
-    			if (detaching) detach_dev(t2);
-    			if (detaching) detach_dev(t3);
-    			if (detaching) detach_dev(t4);
-    			if (detaching) detach_dev(t5);
-    			if (detaching) detach_dev(button0);
-    			if (detaching) detach_dev(t7);
-    			if (detaching) detach_dev(button1);
-    			if (detaching) detach_dev(t9);
-    			if (detaching) detach_dev(button2);
+    			if (detaching) detach_dev(div);
     			mounted = false;
     			run_all(dispose);
     		}
@@ -1295,16 +1569,17 @@ var app = (function () {
     		block,
     		id: create_if_block_1.name,
     		type: "if",
-    		source: "(223:4) {#if $shoppingCart.pancakeSausageSyrup.count}",
+    		source: "(278:6) {#if $shoppingCart.pancakeSausageSyrup.count}",
     		ctx
     	});
 
     	return block;
     }
 
-    // (238:4) {#if $shoppingCart.pancakeSausageMeal.count}
+    // (295:6) {#if $shoppingCart.pancakeSausageMeal.count}
     function create_if_block(ctx) {
-    	let p;
+    	let div;
+    	let h3;
     	let t1;
     	let t2_value = /*$shoppingCart*/ ctx[0].pancakeSausageMeal.count + "";
     	let t2;
@@ -1317,16 +1592,18 @@ var app = (function () {
     	let button1;
     	let t9;
     	let button2;
+    	let div_intro;
     	let mounted;
     	let dispose;
 
     	const block = {
     		c: function create() {
-    			p = element("p");
-    			p.textContent = "Pancakes & Sausage Meal";
-    			t1 = space();
+    			div = element("div");
+    			h3 = element("h3");
+    			h3.textContent = "Pancakes & Sausage Meal";
+    			t1 = text("\n          x");
     			t2 = text(t2_value);
-    			t3 = space();
+    			t3 = text("\n          \n          \n          £");
     			t4 = text(t4_value);
     			t5 = space();
     			button0 = element("button");
@@ -1337,26 +1614,33 @@ var app = (function () {
     			t9 = space();
     			button2 = element("button");
     			button2.textContent = "SuperSize!";
-    			add_location(p, file, 238, 6, 9152);
+    			attr_dev(h3, "class", "svelte-17asmgu");
+    			add_location(h3, file, 296, 10, 10689);
     			attr_dev(button0, "id", "decrement");
-    			add_location(button0, file, 243, 6, 9488);
+    			attr_dev(button0, "class", "svelte-17asmgu");
+    			add_location(button0, file, 301, 10, 11049);
     			attr_dev(button1, "id", "increment");
-    			add_location(button1, file, 246, 6, 9608);
+    			attr_dev(button1, "class", "svelte-17asmgu");
+    			add_location(button1, file, 304, 10, 11181);
     			attr_dev(button2, "id", "isLarge");
-    			add_location(button2, file, 249, 6, 9728);
+    			attr_dev(button2, "class", "svelte-17asmgu");
+    			add_location(button2, file, 307, 10, 11313);
+    			attr_dev(div, "class", "checkout-item");
+    			add_location(div, file, 295, 8, 10616);
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, p, anchor);
-    			insert_dev(target, t1, anchor);
-    			insert_dev(target, t2, anchor);
-    			insert_dev(target, t3, anchor);
-    			insert_dev(target, t4, anchor);
-    			insert_dev(target, t5, anchor);
-    			insert_dev(target, button0, anchor);
-    			insert_dev(target, t7, anchor);
-    			insert_dev(target, button1, anchor);
-    			insert_dev(target, t9, anchor);
-    			insert_dev(target, button2, anchor);
+    			insert_dev(target, div, anchor);
+    			append_dev(div, h3);
+    			append_dev(div, t1);
+    			append_dev(div, t2);
+    			append_dev(div, t3);
+    			append_dev(div, t4);
+    			append_dev(div, t5);
+    			append_dev(div, button0);
+    			append_dev(div, t7);
+    			append_dev(div, button1);
+    			append_dev(div, t9);
+    			append_dev(div, button2);
 
     			if (!mounted) {
     				dispose = [
@@ -1372,18 +1656,17 @@ var app = (function () {
     			if (dirty & /*$shoppingCart*/ 1 && t2_value !== (t2_value = /*$shoppingCart*/ ctx[0].pancakeSausageMeal.count + "")) set_data_dev(t2, t2_value);
     			if (dirty & /*$shoppingCart*/ 1 && t4_value !== (t4_value = Math.trunc(/*$shoppingCart*/ ctx[0].pancakeSausageMeal.price * /*$shoppingCart*/ ctx[0].pancakeSausageMeal.count * 100) / 100 + /*$shoppingCart*/ ctx[0].pancakeSausageMeal.isLarge * /*$shoppingCart*/ ctx[0].pancakeSausageMeal.count + "")) set_data_dev(t4, t4_value);
     		},
+    		i: function intro(local) {
+    			if (!div_intro) {
+    				add_render_callback(() => {
+    					div_intro = create_in_transition(div, fly, { y: 200, duration: 500 });
+    					div_intro.start();
+    				});
+    			}
+    		},
+    		o: noop,
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(p);
-    			if (detaching) detach_dev(t1);
-    			if (detaching) detach_dev(t2);
-    			if (detaching) detach_dev(t3);
-    			if (detaching) detach_dev(t4);
-    			if (detaching) detach_dev(t5);
-    			if (detaching) detach_dev(button0);
-    			if (detaching) detach_dev(t7);
-    			if (detaching) detach_dev(button1);
-    			if (detaching) detach_dev(t9);
-    			if (detaching) detach_dev(button2);
+    			if (detaching) detach_dev(div);
     			mounted = false;
     			run_all(dispose);
     		}
@@ -1393,7 +1676,7 @@ var app = (function () {
     		block,
     		id: create_if_block.name,
     		type: "if",
-    		source: "(238:4) {#if $shoppingCart.pancakeSausageMeal.count}",
+    		source: "(295:6) {#if $shoppingCart.pancakeSausageMeal.count}",
     		ctx
     	});
 
@@ -1401,25 +1684,28 @@ var app = (function () {
     }
 
     function create_fragment(ctx) {
-    	let div3;
+    	let div4;
     	let div0;
-    	let t0;
+    	let h20;
+    	let t1;
     	let ul;
     	let li0;
-    	let t2;
+    	let t3;
     	let li1;
-    	let t4;
+    	let t5;
     	let li2;
-    	let t6;
-    	let div1;
     	let t7;
-    	let div2;
+    	let div1;
     	let t8;
-    	let t9;
+    	let div3;
+    	let div2;
+    	let h21;
     	let t10;
     	let t11;
     	let t12;
     	let t13;
+    	let t14;
+    	let t15;
     	let mounted;
     	let dispose;
 
@@ -1440,84 +1726,103 @@ var app = (function () {
 
     	const block = {
     		c: function create() {
-    			div3 = element("div");
+    			div4 = element("div");
     			div0 = element("div");
-    			t0 = text("Categories area\n    ");
+    			h20 = element("h2");
+    			h20.textContent = "Categories";
+    			t1 = space();
     			ul = element("ul");
     			li0 = element("li");
     			li0.textContent = "McMuffins";
-    			t2 = space();
+    			t3 = space();
     			li1 = element("li");
     			li1.textContent = "Wraps & Rolls";
-    			t4 = space();
+    			t5 = space();
     			li2 = element("li");
     			li2.textContent = "Porridge & Pancakes";
-    			t6 = space();
+    			t7 = space();
     			div1 = element("div");
     			if (if_block0) if_block0.c();
-    			t7 = space();
+    			t8 = space();
+    			div3 = element("div");
     			div2 = element("div");
-    			t8 = text("Shopping cart ");
-    			if (if_block1) if_block1.c();
-    			t9 = space();
-    			if (if_block2) if_block2.c();
+    			h21 = element("h2");
+    			h21.textContent = "Your order";
     			t10 = space();
-    			if (if_block3) if_block3.c();
+    			if (if_block1) if_block1.c();
     			t11 = space();
-    			if (if_block4) if_block4.c();
+    			if (if_block2) if_block2.c();
     			t12 = space();
-    			if (if_block5) if_block5.c();
+    			if (if_block3) if_block3.c();
     			t13 = space();
+    			if (if_block4) if_block4.c();
+    			t14 = space();
+    			if (if_block5) if_block5.c();
+    			t15 = space();
     			if (if_block6) if_block6.c();
+    			attr_dev(h20, "class", "svelte-17asmgu");
+    			add_location(h20, file, 86, 4, 1438);
     			attr_dev(li0, "id", "mcmuffins");
-    			add_location(li0, file, 43, 6, 812);
+    			attr_dev(li0, "class", "svelte-17asmgu");
+    			add_location(li0, file, 88, 6, 1473);
     			attr_dev(li1, "id", "wraps");
-    			add_location(li1, file, 44, 6, 884);
+    			attr_dev(li1, "class", "svelte-17asmgu");
+    			add_location(li1, file, 89, 6, 1545);
     			attr_dev(li2, "id", "porridge");
-    			add_location(li2, file, 45, 6, 956);
-    			add_location(ul, file, 42, 4, 801);
+    			attr_dev(li2, "class", "svelte-17asmgu");
+    			add_location(li2, file, 90, 6, 1617);
+    			attr_dev(ul, "class", "svelte-17asmgu");
+    			add_location(ul, file, 87, 4, 1462);
     			attr_dev(div0, "id", "categories-section");
-    			attr_dev(div0, "class", "svelte-zn040e");
-    			add_location(div0, file, 40, 2, 747);
+    			attr_dev(div0, "class", "svelte-17asmgu");
+    			add_location(div0, file, 85, 2, 1404);
     			attr_dev(div1, "id", "shopping-section");
-    			attr_dev(div1, "class", "svelte-zn040e");
-    			add_location(div1, file, 49, 2, 1053);
-    			attr_dev(div2, "id", "shopping-cart-section");
-    			attr_dev(div2, "class", "svelte-zn040e");
-    			add_location(div2, file, 158, 2, 4818);
-    			attr_dev(div3, "id", "main-container");
-    			attr_dev(div3, "class", "svelte-zn040e");
-    			add_location(div3, file, 39, 0, 719);
+    			attr_dev(div1, "class", "svelte-17asmgu");
+    			add_location(div1, file, 94, 2, 1714);
+    			attr_dev(h21, "class", "svelte-17asmgu");
+    			add_location(h21, file, 205, 6, 5563);
+    			attr_dev(div2, "id", "shopping-cart-container");
+    			attr_dev(div2, "class", "svelte-17asmgu");
+    			add_location(div2, file, 204, 4, 5522);
+    			attr_dev(div3, "id", "shopping-cart-section");
+    			attr_dev(div3, "class", "svelte-17asmgu");
+    			add_location(div3, file, 203, 2, 5485);
+    			attr_dev(div4, "id", "main-container");
+    			attr_dev(div4, "class", "svelte-17asmgu");
+    			add_location(div4, file, 84, 0, 1376);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
     		m: function mount(target, anchor) {
-    			insert_dev(target, div3, anchor);
-    			append_dev(div3, div0);
-    			append_dev(div0, t0);
+    			insert_dev(target, div4, anchor);
+    			append_dev(div4, div0);
+    			append_dev(div0, h20);
+    			append_dev(div0, t1);
     			append_dev(div0, ul);
     			append_dev(ul, li0);
-    			append_dev(ul, t2);
+    			append_dev(ul, t3);
     			append_dev(ul, li1);
-    			append_dev(ul, t4);
+    			append_dev(ul, t5);
     			append_dev(ul, li2);
-    			append_dev(div3, t6);
-    			append_dev(div3, div1);
+    			append_dev(div4, t7);
+    			append_dev(div4, div1);
     			if (if_block0) if_block0.m(div1, null);
-    			append_dev(div3, t7);
+    			append_dev(div4, t8);
+    			append_dev(div4, div3);
     			append_dev(div3, div2);
-    			append_dev(div2, t8);
-    			if (if_block1) if_block1.m(div2, null);
-    			append_dev(div2, t9);
-    			if (if_block2) if_block2.m(div2, null);
+    			append_dev(div2, h21);
     			append_dev(div2, t10);
-    			if (if_block3) if_block3.m(div2, null);
+    			if (if_block1) if_block1.m(div2, null);
     			append_dev(div2, t11);
-    			if (if_block4) if_block4.m(div2, null);
+    			if (if_block2) if_block2.m(div2, null);
     			append_dev(div2, t12);
-    			if (if_block5) if_block5.m(div2, null);
+    			if (if_block3) if_block3.m(div2, null);
     			append_dev(div2, t13);
+    			if (if_block4) if_block4.m(div2, null);
+    			append_dev(div2, t14);
+    			if (if_block5) if_block5.m(div2, null);
+    			append_dev(div2, t15);
     			if (if_block6) if_block6.m(div2, null);
 
     			if (!mounted) {
@@ -1546,10 +1851,15 @@ var app = (function () {
     			if (/*$shoppingCart*/ ctx[0].doubleSausageMcmuffin.count) {
     				if (if_block1) {
     					if_block1.p(ctx, dirty);
+
+    					if (dirty & /*$shoppingCart*/ 1) {
+    						transition_in(if_block1, 1);
+    					}
     				} else {
     					if_block1 = create_if_block_5(ctx);
     					if_block1.c();
-    					if_block1.m(div2, t9);
+    					transition_in(if_block1, 1);
+    					if_block1.m(div2, t11);
     				}
     			} else if (if_block1) {
     				if_block1.d(1);
@@ -1559,10 +1869,15 @@ var app = (function () {
     			if (/*$shoppingCart*/ ctx[0].doubleSausageMcmuffinMeal.count) {
     				if (if_block2) {
     					if_block2.p(ctx, dirty);
+
+    					if (dirty & /*$shoppingCart*/ 1) {
+    						transition_in(if_block2, 1);
+    					}
     				} else {
     					if_block2 = create_if_block_4(ctx);
     					if_block2.c();
-    					if_block2.m(div2, t10);
+    					transition_in(if_block2, 1);
+    					if_block2.m(div2, t12);
     				}
     			} else if (if_block2) {
     				if_block2.d(1);
@@ -1572,10 +1887,15 @@ var app = (function () {
     			if (/*$shoppingCart*/ ctx[0].baconBrownSauce.count) {
     				if (if_block3) {
     					if_block3.p(ctx, dirty);
+
+    					if (dirty & /*$shoppingCart*/ 1) {
+    						transition_in(if_block3, 1);
+    					}
     				} else {
     					if_block3 = create_if_block_3(ctx);
     					if_block3.c();
-    					if_block3.m(div2, t11);
+    					transition_in(if_block3, 1);
+    					if_block3.m(div2, t13);
     				}
     			} else if (if_block3) {
     				if_block3.d(1);
@@ -1585,10 +1905,15 @@ var app = (function () {
     			if (/*$shoppingCart*/ ctx[0].baconBrownSauceMeal.count) {
     				if (if_block4) {
     					if_block4.p(ctx, dirty);
+
+    					if (dirty & /*$shoppingCart*/ 1) {
+    						transition_in(if_block4, 1);
+    					}
     				} else {
     					if_block4 = create_if_block_2(ctx);
     					if_block4.c();
-    					if_block4.m(div2, t12);
+    					transition_in(if_block4, 1);
+    					if_block4.m(div2, t14);
     				}
     			} else if (if_block4) {
     				if_block4.d(1);
@@ -1598,10 +1923,15 @@ var app = (function () {
     			if (/*$shoppingCart*/ ctx[0].pancakeSausageSyrup.count) {
     				if (if_block5) {
     					if_block5.p(ctx, dirty);
+
+    					if (dirty & /*$shoppingCart*/ 1) {
+    						transition_in(if_block5, 1);
+    					}
     				} else {
     					if_block5 = create_if_block_1(ctx);
     					if_block5.c();
-    					if_block5.m(div2, t13);
+    					transition_in(if_block5, 1);
+    					if_block5.m(div2, t15);
     				}
     			} else if (if_block5) {
     				if_block5.d(1);
@@ -1611,9 +1941,14 @@ var app = (function () {
     			if (/*$shoppingCart*/ ctx[0].pancakeSausageMeal.count) {
     				if (if_block6) {
     					if_block6.p(ctx, dirty);
+
+    					if (dirty & /*$shoppingCart*/ 1) {
+    						transition_in(if_block6, 1);
+    					}
     				} else {
     					if_block6 = create_if_block(ctx);
     					if_block6.c();
+    					transition_in(if_block6, 1);
     					if_block6.m(div2, null);
     				}
     			} else if (if_block6) {
@@ -1621,10 +1956,17 @@ var app = (function () {
     				if_block6 = null;
     			}
     		},
-    		i: noop,
+    		i: function intro(local) {
+    			transition_in(if_block1);
+    			transition_in(if_block2);
+    			transition_in(if_block3);
+    			transition_in(if_block4);
+    			transition_in(if_block5);
+    			transition_in(if_block6);
+    		},
     		o: noop,
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(div3);
+    			if (detaching) detach_dev(div4);
 
     			if (if_block0) {
     				if_block0.d();
@@ -1706,6 +2048,8 @@ var app = (function () {
     	$$self.$capture_state = () => ({
     		shoppingCategory,
     		shoppingCart,
+    		fade,
+    		fly,
     		name,
     		handleCategorySelect,
     		handleAddToCartButton,
